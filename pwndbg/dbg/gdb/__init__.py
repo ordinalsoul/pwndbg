@@ -29,7 +29,9 @@ from pwndbg.aglib import load_aglib
 from pwndbg.dbg import selection
 from pwndbg.gdblib import gdb_version
 from pwndbg.gdblib import load_gdblib
-from pwndbg.lib.arch import PWNDBG_SUPPORTED_ARCHITECTURES_TYPE
+from pwndbg.lib.arch import ArchAttribute
+from pwndbg.lib.arch import ArchDefinition
+from pwndbg.lib.arch import Platform
 from pwndbg.lib.memory import PAGE_MASK
 from pwndbg.lib.memory import PAGE_SIZE
 
@@ -58,36 +60,21 @@ gdb_architecture_name_fixup_list = (
     "s390:64-bit",
 )
 
-
-class GDBArch(pwndbg.dbg_mod.Arch):
-    _endian: Literal["little", "big"]
-    _name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE
-    _ptrsize: int
-
-    def __init__(
-        self,
-        endian: Literal["little", "big"],
-        name: PWNDBG_SUPPORTED_ARCHITECTURES_TYPE,
-        ptrsize: int,
-    ):
-        self._endian = endian
-        self._name = name
-        self._ptrsize = ptrsize
-
-    @override
-    @property
-    def endian(self) -> Literal["little", "big"]:
-        return self._endian
-
-    @override
-    @property
-    def name(self) -> PWNDBG_SUPPORTED_ARCHITECTURES_TYPE:
-        return self._name
-
-    @override
-    @property
-    def ptrsize(self) -> int:
-        return self._ptrsize
+# `show architecture` returns a string like "mips:isa32r5"
+gdb_mips_to_arch_attribute_map = {
+    "mips5": ArchAttribute.MIPS_ISA_5,
+    "micromips": ArchAttribute.MIPS_ISA_MICRO,
+    "isa32": ArchAttribute.MIPS_ISA_32,
+    "isa32r2": ArchAttribute.MIPS_ISA_32R2,
+    "isa32r3": ArchAttribute.MIPS_ISA_32R3,
+    "isa32r5": ArchAttribute.MIPS_ISA_32R5,
+    "isa32r6": ArchAttribute.MIPS_ISA_32R6,
+    "isa64": ArchAttribute.MIPS_ISA_64,
+    "isa64r2": ArchAttribute.MIPS_ISA_64R2,
+    "isa64r3": ArchAttribute.MIPS_ISA_64R3,
+    "isa64r5": ArchAttribute.MIPS_ISA_64R5,
+    "isa64r6": ArchAttribute.MIPS_ISA_64R6,
+}
 
 
 def parse_and_eval(expression: str, global_context: bool) -> gdb.Value:
@@ -723,7 +710,7 @@ class GDBProcess(pwndbg.dbg_mod.Process):
             return []
 
     @override
-    def arch(self) -> pwndbg.dbg_mod.Arch:
+    def arch(self) -> ArchDefinition:
         ptrsize = pwndbg.aglib.typeinfo.ptrsize
         not_exactly_arch = False
 
@@ -740,6 +727,14 @@ class GDBProcess(pwndbg.dbg_mod.Process):
             not_exactly_arch = True
 
         arch = arch.lower()
+
+        arch_attributes = []
+
+        if arch.startswith("mips:"):
+            isa = arch[5:]
+
+            if (attribute := gdb_mips_to_arch_attribute_map.get(isa)) is not None:
+                arch_attributes.append(attribute)
 
         # Below, we fix the fetched architecture
         for match in gdb_architecture_name_fixup_list:
@@ -765,12 +760,24 @@ class GDBProcess(pwndbg.dbg_mod.Process):
                     match = "powerpc"
                 elif match == "s390:64-bit":
                     match = "s390x"
-                return GDBArch(endian, match, ptrsize)  # type: ignore[arg-type]
+                return ArchDefinition(
+                    name=match,  # type: ignore[arg-type]
+                    ptrsize=ptrsize,
+                    endian=endian,
+                    platform=Platform.LINUX,
+                    attributes=arch_attributes,
+                )
 
         if not_exactly_arch:
             raise RuntimeError(f"Could not deduce architecture from: {arch}")
 
-        return GDBArch(endian, arch, ptrsize)  # type: ignore[arg-type]
+        return ArchDefinition(
+            name=arch,  # type: ignore[arg-type]
+            ptrsize=ptrsize,
+            endian=endian,
+            platform=Platform.LINUX,
+            attributes=arch_attributes,
+        )
 
     @override
     def break_at(
