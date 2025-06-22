@@ -12,6 +12,7 @@ import pwndbg.aglib.memory as memory
 import pwndbg.aglib.typeinfo as typeinfo
 import pwndbg.color as C
 import pwndbg.color.message as message
+from pwndbg.aglib.heap.mallocng import mallocng as ng
 from pwndbg.commands import CommandCategory
 from pwndbg.lib.pretty_print import Property
 from pwndbg.lib.pretty_print import PropertyPrinter
@@ -470,3 +471,63 @@ def mallocng_group(address: int) -> None:
     except pwndbg.dbg_mod.Error as e:
         print(message.error(f"Failed loading meta: {e}"))
         return
+
+
+parser = argparse.ArgumentParser(
+    description="""
+Find slot which contains the given address.
+
+Returns the `start` of the slot. We say a slot 'contains'
+an address if the address is in [start, start + stride).
+    """,
+)
+parser.add_argument(
+    "address",
+    type=int,
+    help="The address to look for.",
+)
+parser.add_argument(
+    "-a",
+    "--all",
+    action="store_true",
+    help="Print out all information. Including meta and group data.",
+)
+parser.add_argument(
+    "-m",
+    "--metadata",
+    action="store_true",
+    help=(
+        "If the given address falls onto some in-band metadata, return the slot which owns that metadata."
+        " In other words, the containment check becomes [start - IB, end)."
+    ),
+)
+parser.add_argument(
+    "-s",
+    "--shallow",
+    action="store_true",
+    help="Return the outermost slot hit without going deeper even if this slot contains a group.",
+)
+
+
+@pwndbg.commands.Command(
+    parser,
+    category=CommandCategory.MUSL,
+    aliases=["ng-find"],
+)
+@pwndbg.commands.OnlyWhenRunning
+def mallocng_find(
+    address: int, all: bool = False, metadata: bool = False, shallow: bool = False
+) -> None:
+    if not memory.is_readable_address(address):
+        print(message.error(f"Address {hex(address)} not readable."))
+        return
+
+    ng.init_if_needed()
+
+    slot_start = ng.containing(address, metadata, shallow)
+
+    if slot_start == 0:
+        print(message.info("No slot found containing that address."))
+        return
+
+    mallocng_slot_user(mallocng.Slot.from_start(slot_start).p, all=all)

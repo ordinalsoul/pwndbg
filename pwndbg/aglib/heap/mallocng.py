@@ -6,11 +6,18 @@ https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng
 from __future__ import annotations
 
 from typing import List
+from typing import Optional
+from typing import Tuple
+
+from typing_extensions import override
 
 import pwndbg
 import pwndbg.aglib.arch
+import pwndbg.aglib.heap.heap
 import pwndbg.aglib.memory as memory
+import pwndbg.aglib.stack
 import pwndbg.aglib.typeinfo
+import pwndbg.color.message as message
 
 # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L14
 # Slot granularity.
@@ -108,6 +115,21 @@ class Group:
         """
         # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L234
         return self.meta.stride * self.meta.cnt + UNIT
+
+    def set_meta(self, meta: Meta) -> None:
+        """
+        Sets the meta object for this group.
+
+        If the meta for this group is already calculated by the callee,
+        use this to prevent it from being wastefully recalculated.
+        """
+        self._meta = meta
+
+    def at_index(self, idx: int) -> int:
+        """
+        Get the address of the slot at index idx.
+        """
+        return self.storage + idx * self.meta.stride
 
 
 class Slot:
@@ -303,6 +325,37 @@ class Slot:
         # We can calculate it more easily than musl does:
         return (self.p - self.start) // UNIT
 
+    def contains_group(self) -> bool:
+        """
+        Does this slot nest a group?
+        """
+        # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L269
+        return self.reserved == 6
+
+    @classmethod
+    def from_p(cls, p: int) -> "Slot":
+        return cls(p)
+
+    @classmethod
+    def from_start(cls, start: int) -> "Slot":
+        idx_or_marker = memory.u8(start - 3)
+        if idx_or_marker == 224:
+            # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L217
+            # p is at an offset from start
+            # Read the cyclic offset to calculate it.
+            off = memory.u16(start - 2)
+            p = start + off * UNIT
+            obj = cls(p)
+        else:
+            p = start
+            obj = cls(p)
+
+        # FIXME: Not good if the slot is corrupted and we can't
+        # access the meta.
+        assert obj.start == start
+
+        return obj
+
 
 class Meta:
     """
@@ -352,32 +405,32 @@ class Meta:
         endian = pwndbg.aglib.arch.endian
 
         # Read the whole struct.
-        data = memory.read(self.addr, ptrsize * 3 + 2 * int_size() + 8 * ptrsize)
+        data = memory.read(self.addr, Meta.sizeof())
 
         cur_offset = 0
-        self._prev = pwndbg.aglib.arch.unpack(data[cur_offset:ptrsize])
-        cur_offset += ptrsize
-        self._next = pwndbg.aglib.arch.unpack(data[cur_offset : (cur_offset + ptrsize)])
-        cur_offset += ptrsize
-        self._mem = pwndbg.aglib.arch.unpack(data[cur_offset : (cur_offset + ptrsize)])
-        cur_offset += ptrsize
-        self._avail_mask = int.from_bytes(
-            data[cur_offset : (cur_offset + int_size())], endian, signed=False
-        )
-        cur_offset += int_size()
-        self._freed_mask = int.from_bytes(
-            data[cur_offset : (cur_offset + int_size())], endian, signed=False
-        )
-        cur_offset += int_size()
+
+        def next_int(size: int, signed: bool = False) -> int:
+            nonlocal cur_offset
+            val = int.from_bytes(data[cur_offset : (cur_offset + size)], endian, signed=signed)
+            cur_offset += size
+            return val
+
+        self._prev = next_int(ptrsize)
+        self._next = next_int(ptrsize)
+        self._mem = next_int(ptrsize)
+        self._avail_mask = next_int(int_size())
+        self._freed_mask = next_int(int_size())
         # I think this is how I should read a bitfield.
         # http://mjfrazer.org/mjfrazer/bitfields/
-        flags = int.from_bytes(data[cur_offset : (cur_offset + ptrsize)], endian, signed=False)
+        flags = next_int(ptrsize)
         self._last_idx = flags & 0b11111
         self._freeable = (flags >> 5) & 1
         self._sizeclass = (flags >> 6) & 0b111111
         self._maplen = flags >> 12
 
-        # All the other fields are calculated without
+        assert cur_offset == Meta.sizeof()
+
+        # All other values are calculated without
         # memory reads.
 
     @property
@@ -527,11 +580,441 @@ class Meta:
             # The meta is corrupted.
             return -1
 
+    @staticmethod
+    def sizeof():
+        return 2 * int_size() + 4 * pwndbg.aglib.arch.ptrsize
+
 
 class MetaArea:
+    """
+    Slabs that contain metas, linked in a singly-linked list.
+
+    https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L34
+    struct meta_area {
+      uint64_t check;
+      struct meta_area *next;
+      int nslots;
+      struct meta slots[];
+    };
+    """
+
     def __init__(self, addr: int) -> None:
-        self.addr = addr
+        self.addr: int = addr
+
+        self.check: int = 0
+        self.meta_area: int = 0
+        self.nslots: int = 0
+        self.slots: int = 0
+
+        self.load()
+
+    def load(self):
+        ptrsize = pwndbg.aglib.arch.ptrsize
+        uint64size = pwndbg.aglib.typeinfo.uint64.sizeof
+        endian = pwndbg.aglib.arch.endian
+
+        data: bytearray = memory.read(self.addr, uint64size + ptrsize + int_size())
+
+        cur_offset = 0
+
+        def next_int(size: int, signed: bool = False) -> int:
+            nonlocal cur_offset
+            val = int.from_bytes(data[cur_offset : (cur_offset + size)], endian, signed=signed)
+            cur_offset += size
+            return val
+
+        self.check = next_int(uint64size)
+        self.next = next_int(ptrsize)
+        self.nslots = next_int(int_size(), True)
+
+        # Alignment adjustment
+        cur_offset += ptrsize - int_size()
+
+        self.slots = self.addr + cur_offset
+
+    def at_index(self, idx: int) -> int:
+        """
+        Returns the address of the meta object located
+        at index idx.
+        """
+        return self.slots + idx * Meta.sizeof()
 
 
-class Mallocng:
-    pass
+class MallocContext:
+    """
+    The global object that holds all allocator state.
+
+    https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/meta.h#L41
+    struct malloc_context {
+      uint64_t secret;
+    #ifndef PAGESIZE
+      size_t pagesize;
+    #endif
+      int init_done;
+      unsigned mmap_counter;
+      struct meta *free_meta_head;
+      struct meta *avail_meta;
+      size_t avail_meta_count, avail_meta_area_count, meta_alloc_shift;
+      struct meta_area *meta_area_head, *meta_area_tail;
+      unsigned char *avail_meta_areas;
+      struct meta *active[48];
+      size_t usage_by_class[48];
+      uint8_t unmap_seq[32], bounces[32];
+      uint8_t seq;
+      uintptr_t brk;
+    };
+    """
+
+    def __init__(self, addr: int) -> None:
+        self.addr: int = addr
+
+        self.secret: int = 0
+        self.pagesize: int = 0
+        self.init_done: int = 0
+        self.mmap_counter: int = 0
+        self.free_meta_head: int = 0
+        self.avail_meta: int = 0
+        self.avail_meta_count: int = 0
+        self.avail_meta_area_count: int = 0
+        self.meta_alloc_shift: int = 0
+        self.meta_area_head: int = 0
+        self.meta_area_tail: int = 0
+        self.avail_meta_areas: int = 0
+        self.active: List[int] = []
+        self.usage_by_class: List[int] = []
+        self.unmap_seq: List[int] = []
+        self.bounces: List[int] = []
+        self.seq: int = 0
+        self.brk: int = 0
+
+        self.sizeof: int = 0
+        self.has_pagesize_field: bool = False
+
+        # We will always load() since we read this object
+        # only once - there is no performance benefit to lazy
+        # evaluation.
+        self.load()
+
+    def load(self):
+        ptrsize = pwndbg.aglib.arch.ptrsize
+        size_tsize = pwndbg.aglib.typeinfo.size_t.sizeof
+        unsignedsize = pwndbg.aglib.typeinfo.uint.sizeof
+        uint8size = pwndbg.aglib.typeinfo.uint8.sizeof
+        uint64size = pwndbg.aglib.typeinfo.uint64.sizeof
+        endian = pwndbg.aglib.arch.endian
+
+        # We will assume the struct has the pagesize field at first (even though it usually
+        # doesn't), which allows us to only do one memory read. This is 0x3A8 bytes on x86_64.
+        self.sizeof = uint64size + size_tsize + int_size() + unsignedsize + ptrsize * 2
+        self.sizeof += size_tsize * 3 + ptrsize * 2 + ptrsize + ptrsize * 48 + size_tsize * 48
+        self.sizeof += uint8size * 32 * 2 + uint8size + (ptrsize - uint8size) + ptrsize
+
+        data: bytearray = memory.read(self.addr, self.sizeof)
+
+        cur_offset = 0
+
+        def next_int(size: int, signed: bool = False) -> int:
+            nonlocal cur_offset
+            val = int.from_bytes(data[cur_offset : (cur_offset + size)], endian, signed=signed)
+            cur_offset += size
+            return val
+
+        self.secret = next_int(uint64size)
+
+        # We will read `int` bytes past the `secret`. The `init_done` field can only contain
+        # values 0 and 1, so if we get that we know the struct doesn't have the pagesize field.
+        # If it contains a value > 1 it must be describing a page size.
+        something = int.from_bytes(
+            data[cur_offset : (cur_offset + int_size())], endian, signed=True
+        )
+        self.has_pagesize_field = something > 1
+
+        if self.has_pagesize_field:
+            self.pagesize = next_int(size_tsize)
+            self.init_done = next_int(int_size(), True)
+        else:
+            self.init_done = something
+            cur_offset += int_size()
+
+            # Fix our assumption, we don't have `size_t pagesize` field.
+            self.sizeof -= size_tsize
+
+        self.mmap_counter = next_int(unsignedsize)
+        self.free_meta_head = next_int(ptrsize)
+        self.avail_meta = next_int(ptrsize)
+        self.avail_meta_count = next_int(size_tsize)
+        self.avail_meta_area_count = next_int(size_tsize)
+        self.meta_alloc_shift = next_int(size_tsize)
+        self.meta_area_head = next_int(ptrsize)
+        self.meta_area_tail = next_int(ptrsize)
+        self.avail_meta_areas = next_int(ptrsize)
+
+        assert len(size_classes) == 48
+
+        for i in range(len(size_classes)):
+            cur_active = next_int(ptrsize)
+            self.active.append(cur_active)
+
+        for i in range(len(size_classes)):
+            cur_usage = next_int(size_tsize)
+            self.usage_by_class.append(cur_usage)
+
+        for i in range(32):
+            cur_seq = next_int(uint8size)
+            self.unmap_seq.append(cur_seq)
+
+        for i in range(32):
+            cur_bounce = next_int(uint8size)
+            self.bounces.append(cur_bounce)
+
+        self.seq = next_int(uint8size)
+
+        # Adjust for alignment
+        cur_offset += ptrsize - uint8size
+
+        self.brk = next_int(ptrsize)
+
+        assert cur_offset == self.sizeof
+
+
+class Mallocng(pwndbg.aglib.heap.heap.MemoryAllocator):
+    """
+    Tracks the allocator state.
+    By leveraging the __malloc_context symbol.
+
+    Import this singleton class like:
+    from pwndbg.aglib.heap.mallocng import mallocng as ng
+
+    and make sure that you have run ng.init_if_needed()
+    before you used the object.
+    """
+
+    def __init__(self):
+        self.finished_init: bool = False
+
+        self.ctx_addr: int = 0
+        self.ctx: Optional[MallocContext] = None
+        self.has_debug_syms: bool = False
+        self.secret: bytearray = b""
+        self.hope: bool = True
+
+    def init_if_needed(self):
+        """
+        We want this class to be a singleton, but also we can't
+        initialize it as soon as pwndbg is loaded.
+
+        Users of the object are responsible for calling this to
+        make sure the object is initialized.
+        """
+        if self.finished_init:
+            return
+
+        self.ctx_addr = 0
+        self.ctx = None
+        self.has_debug_syms = False
+        self.secret = b""
+        self.hope = True
+
+        self.set_ctx_addr()
+
+        if self.ctx_addr and self.hope:
+            self.ctx = MallocContext(self.ctx_addr)
+
+        self.finished_init = True
+
+    def set_ctx_addr(self):
+        """
+        Find where the __malloc_context global symbol is. Try using debug information,
+        but if it isn't available try using a heuristic.
+        """
+        uint64size = pwndbg.aglib.typeinfo.uint64.sizeof
+
+        self.ctx_addr = pwndbg.aglib.symbol.lookup_symbol_addr("__malloc_context")
+        if self.ctx_addr is not None:
+            self.has_debug_syms = True
+            self.secret = memory.read(self.ctx_addr, uint64size)
+            return
+
+        # No debug information :(
+        self.has_debug_syms = False
+
+        # We will find the __malloc_context object by searching memory for
+        # the secret.
+        # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/malloc.c#L50
+        # Extract the secret first.
+        # https://elixir.bootlin.com/musl/v1.2.5/source/src/malloc/mallocng/glue.h#L49
+        at_random = int(pwndbg.auxv.get()["AT_RANDOM"])
+        self.secret = memory.read(at_random + 8, uint64size)
+
+        secret_matches = list(
+            pwndbg.search.search(self.secret, executable=False, writable=True, aligned=uint64size)
+        )
+
+        # There are going to be multiple matches. We don't
+        # want those on the stack (actual AT_RANDOM) or heap
+        # (structures copying the secret). We want it either from the libc.so
+        # mapping (if musl is dynamically linked) or the executable's
+        # mapping (if musl is statically linked).
+        possible: List[Tuple[int, str]] = []
+        thread_stacks = pwndbg.aglib.stack.get().values()
+
+        for sm in secret_matches:
+            if any(sm in stack_page for stack_page in thread_stacks):
+                continue
+
+            mapping_name = pwndbg.aglib.vmmap.find(sm).objfile
+            if "[heap" in mapping_name:
+                continue
+
+            possible.append((sm, mapping_name))
+
+        if not possible:
+            print(message.error("Couldn't find __malloc_context, even with heuristic."))
+            print(message.error("Musl mallocng commands will not work."))
+            self.ctx_addr = 0
+            self.hope = False
+            return
+
+        if pwndbg.dbg.selected_inferior().is_dynamically_linked():
+            for addr, mapname in possible:
+                if mapname.endswith("libc.so"):
+                    self.ctx_addr = addr
+                    return
+
+            for addr, mapname in possible:
+                if mapname.contains("libc"):
+                    self.ctx_addr = addr
+                    return
+
+            print(message.warn("Couldn't find __malloc_context in a 'libc' mapping,"))
+            print(message.warn(f"using mapping '{possible[0][1]}',"))
+            print(
+                message.warn(
+                    "and assuming __malloc_context is at "
+                    f"{pwndbg.color.memory.get(possible[0][0])}."
+                )
+            )
+            print(message.warn("The heap commands may be unreliable."))
+        else:
+            # Statically linked.
+            # TODO: We should find the Executable Object in the mappings
+            # and use that to determine which match is correct. Not sure
+            # how to do that though so fall through for now.
+            pass
+
+        self.ctx_addr = possible[0][0]
+
+    @override
+    def libc_has_debug_syms(self) -> bool:
+        return self.has_debug_syms
+
+    @override
+    def containing(self, address: int, metadata: bool = False, shallow: bool = False) -> int:
+        """
+        Get the `start` of a slot which contains this address.
+
+        We say a slot "contains" an address, if the address is in
+        [start, start + stride). Thus, this will match the previous
+        slot if you provide the address of the header inband metadata
+        of a slot.
+
+        If `metadata` is True, then we check [start - IB, end) for
+        containment.
+
+        If `shallow` is True, return the first slot hit without trying
+        to look for nested groups.
+        """
+        hit_group: Optional[Group] = None
+
+        meta_area_addr = self.ctx.meta_area_head
+        while meta_area_addr:
+            try:
+                meta_area = MetaArea(meta_area_addr)
+            except pwndbg.dbg_mod.Error as e:
+                # Can't get `next` if the main_area is corrupted.
+                print(
+                    message.error(
+                        f"Mallocng.containing: Could not read meta_area ({e}), returning early."
+                    )
+                )
+                return 0
+
+            # Iterate over all metas in the meta_area.
+            for i in range(meta_area.nslots):
+                try:
+                    meta = Meta(meta_area.at_index(i))
+                    if not meta.mem:
+                        # Skip unused metas.
+                        continue
+
+                    group = Group(meta.mem)
+                    group.set_meta(meta)
+                    group_end = group.addr + group.group_size
+
+                    # Check if our address is inside the group.
+                    if group.addr <= address < group_end:
+                        # Yes it is!
+                        hit_group = group
+                        break
+                except pwndbg.dbg_mod.Error as e:
+                    print(
+                        message.error(
+                            "Mallocng.containing: Could not read/parse meta at"
+                            f" {hex(meta.addr)} ({e}), skipping it.."
+                        )
+                    )
+                    continue
+
+            if hit_group:
+                break
+
+            meta_area_addr = meta_area.next
+
+        if hit_group is None:
+            return 0
+
+        hit_slot: Optional[Slot] = None
+
+        metadata_offset = IB if metadata else 0
+
+        try:
+            # Recursively go into deeper nested groups until we find a slot
+            # which doesn't house a group. Don't recurse after first hit if shallow = True.
+            while hit_slot is None or (not shallow and hit_slot.contains_group()):
+                valid_start = hit_group.storage - metadata_offset
+
+                if address < valid_start:
+                    # Bleh, the address is in the group's header
+                    # (or the first slot's IB header). What to do?
+                    if hit_slot is not None:
+                        # If we are already in some slot, just return
+                        # that slot since we can't look any deeper.
+                        return hit_slot.start
+                    else:
+                        # We are in no slot.
+                        # We could return *some* information to the callee
+                        # but alas, let's be technically correct.
+                        return 0
+
+                # Calculate the correct inner slot.
+                slot_idx = (address - valid_start) // hit_group.meta.stride
+
+                hit_slot = Slot.from_start(hit_group.at_index(slot_idx))
+                hit_group = Group(hit_slot.p)
+
+            return hit_slot.start
+
+        except pwndbg.dbg_mod.Error as e:
+            print(
+                message.error(
+                    "Mallocng.containing: Failed reading memory while traversing"
+                    f" nested groups: {e}.\nReturning last valid slot."
+                )
+            )
+            if hit_slot is None:
+                return 0
+            else:
+                return hit_slot.start
+
+
+mallocng = Mallocng()
