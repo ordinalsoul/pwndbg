@@ -10,6 +10,7 @@ from typing import List
 from typing import Tuple
 from typing import TypeVar
 
+from elftools.elf.elffile import ELFFile
 from typing_extensions import ParamSpec
 
 import pwndbg
@@ -44,19 +45,18 @@ def BIT(shift: int):
 def has_debug_symbols(*required: str, checkall: bool = True) -> bool:
     if not required:
         required = ("commit_creds",)
-    if checkall:
-        return all(pwndbg.aglib.symbol.lookup_symbol(sym) is not None for sym in required)
-    # check any
-    return any(pwndbg.aglib.symbol.lookup_symbol(sym) is not None for sym in required)
+    required_syms_iter = (pwndbg.aglib.symbol.lookup_symbol(sym) is not None for sym in required)
+    return all(required_syms_iter) if checkall else any(required_syms_iter)
 
 
 @pwndbg.lib.cache.cache_until("objfile")
 def has_debug_info() -> bool:
-    # Check for an arbitrary type and symbol name that are not likely to change
-    return (
-        pwndbg.aglib.typeinfo.load("struct pipe_buffer") is not None
-        and pwndbg.aglib.symbol.lookup_symbol_addr("linux_banner") is not None
-    )
+    path = pwndbg.aglib.proc.exe
+    if path is None:
+        return False
+    vmlinux = open(path, "rb")
+    elf = ELFFile(vmlinux)
+    return any(section.name == ".debug_info" for section in elf.iter_sections())
 
 
 def requires_debug_symbols(
