@@ -344,6 +344,30 @@ builtin $gs_base variable.
 
 ----------
 
+### **heap**
+
+``` {.python .no-copy}
+heap(offset: gdb.Value = gdb.Value(0)) -> int
+```
+
+Returns the heap base address, optionally rebased by an offset value.
+
+### Example
+```
+pwndbg> p/x $heap()
+$1 = 0x555555554000
+pwndbg> p/x $heap(0x40)
+$2 = 0x555555554040
+pwndbg> p/x $heap(40)
+$3 = 0x555555554028
+```
+Easier way to determine heap base with useful message if it heap base cannot be determined.
+Works with hex and decimal offsets.
+
+-----------------
+
+
+
 ### **hex2ptr**
 
 
