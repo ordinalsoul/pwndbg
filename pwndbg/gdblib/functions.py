@@ -148,14 +148,10 @@ def heap(offset: gdb.Value = gdb.Value(0)) -> int:
         $1 = 0x555555780000
         pwndbg> p/x $heap(0x40)
         $2 = 0x555555780040
-        pwndbg> vmmap heap
-            0x555555780000     0x5555557a1000 rw-p    21000      0 [heap]
         ```
         If no mapping named like '[heap]' is found, an error is raised.
         """
-    # Try to find a mapping that represents the process heap.
-    # On glibc/Linux this is typically named "[heap]" in /proc/<pid>/maps,
-    # which pwndbg surfaces as the mapping's objfile.
+
     for p in pwndbg.aglib.vmmap.get():
         name = getattr(p, "objfile", "") or ""
         lname = name.lower()
