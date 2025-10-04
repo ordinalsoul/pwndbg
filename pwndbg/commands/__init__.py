@@ -37,7 +37,6 @@ from pwndbg.aglib.heap.ptmalloc import GlibcMemoryAllocator
 from pwndbg.aglib.heap.ptmalloc import HeuristicHeap
 from pwndbg.aglib.heap.ptmalloc import SymbolUnresolvableError
 
-from . import heap_convenience
 
 log = logging.getLogger(__name__)
 
